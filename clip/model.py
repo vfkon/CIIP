@@ -395,8 +395,145 @@ def convert_weights(model: nn.Module):
 
     model.apply(_convert_weights_to_fp16)
 
+class CIIP(nn.Module):
+    def __init__(self,
+                 embed_dim: int,
+                 # vision1
+                 image_resolution: int,
+                 vision_layers: Union[Tuple[int, int, int, int], int],
+                 vision_width: int,
+                 vision_patch_size: int,
+                 # vision2
+                 image_resolution2: int,
+                 vision_layers2: Union[Tuple[int, int, int, int], int],
+                 vision_width2: int,
+                 vision_patch_size2: int
+                 ):
+        super().__init__()
 
-def build_model(state_dict: dict):
+        self.context_length = context_length
+
+        if isinstance(vision_layers, (tuple, list)):
+            vision_heads = vision_width * 32 // 64
+            self.visual = ModifiedResNet(
+                layers=vision_layers,
+                output_dim=embed_dim,
+                heads=vision_heads,
+                input_resolution=image_resolution,
+                width=vision_width
+            )
+        else:
+            vision_heads = vision_width // 64
+            self.visual = VisionTransformer(
+                input_resolution=image_resolution,
+                patch_size=vision_patch_size,
+                width=vision_width,
+                layers=vision_layers,
+                heads=vision_heads,
+                output_dim=embed_dim
+            )
+
+        if isinstance(vision_layers2, (tuple, list)):
+            vision_heads2 = vision_width2 * 32 // 64
+            self.visual2 = ModifiedResNet(
+                layers=vision_layers2,
+                output_dim=embed_dim,
+                heads=vision_heads2,
+                input_resolution=image_resolution2,
+                width=vision_width2
+            )
+        else:
+            vision_heads2 = vision_width2 // 64
+            self.visual = VisionTransformer(
+                input_resolution=image_resolution2,
+                patch_size=vision_patch_size2,
+                width=vision_width2,
+                layers=vision_layers2,
+                heads=vision_heads2,
+                output_dim=embed_dim
+            )
+        self.initialize_parameters()
+
+    def initialize_parameters(self):
+        nn.init.normal_(self.token_embedding.weight, std=0.02)
+        nn.init.normal_(self.positional_embedding, std=0.01)
+
+        if isinstance(self.visual, ModifiedResNet):
+            if self.visual.attnpool is not None:
+                std = self.visual.attnpool.c_proj.in_features ** -0.5
+                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
+                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std)
+
+            for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
+                for name, param in resnet_block.named_parameters():
+                    if name.endswith("bn3.weight"):
+                        nn.init.zeros_(param)
+        if isinstance(self.visual2, ModifiedResNet):
+            if self.visual2.attnpool is not None:
+                std = self.visual.attnpool.c_proj.in_features ** -0.5
+                nn.init.normal_(self.visual2.attnpool.q_proj.weight, std=std)
+                nn.init.normal_(self.visual2.attnpool.k_proj.weight, std=std)
+                nn.init.normal_(self.visual2.attnpool.v_proj.weight, std=std)
+                nn.init.normal_(self.visual2.attnpool.c_proj.weight, std=std)
+
+            for resnet_block in [self.visual2.layer1, self.visual2.layer2, self.visual2.layer3, self.visual2.layer4]:
+                for name, param in resnet_block.named_parameters():
+                    if name.endswith("bn3.weight"):
+                        nn.init.zeros_(param)
+
+    @property
+    def dtype(self):
+        return self.visual.conv1.weight.dtype
+
+    def encode_image1(self, image):
+        return self.visual(image.type(self.dtype))
+
+    def encode_image2(self, image):
+        return self.visual2(image.type(self.dtype))
+
+    def forward(self, image, image2):
+        image_features = self.encode_image(image)
+        text_features = self.encode_image2(image2)
+
+        # normalized features
+        image_features = image_features / image_features.norm(dim=1, keepdim=True)
+        image_features2 = image_features / image_features.norm(dim=1, keepdim=True)
+
+        logit_scale = self.logit_scale.exp()
+        logits_per_image = logit_scale * image_features @ image_features2.t()
+        logits_per_image2 = logits_per_image.t()
+
+        # shape = [global_batch_size, global_batch_size]
+        return logits_per_image, logits_per_image2
+
+
+def convert_weights(model: nn.Module):
+    """Convert applicable model parameters to fp16"""
+
+    def _convert_weights_to_fp16(l):
+        if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+            l.weight.data = l.weight.data.half()
+            if l.bias is not None:
+                l.bias.data = l.bias.data.half()
+
+        if isinstance(l, nn.MultiheadAttention):
+            for attr in [*[f"{s}_proj_weight" for s in ["in", "q", "k", "v"]], "in_proj_bias", "bias_k", "bias_v"]:
+                tensor = getattr(l, attr)
+                if tensor is not None:
+                    tensor.data = tensor.data.half()
+
+        for name in ["text_projection", "proj"]:
+            if hasattr(l, name):
+                attr = getattr(l, name)
+                if attr is not None:
+                    attr.data = attr.data.half()
+
+    model.apply(_convert_weights_to_fp16)
+
+
+def build_model(state_dict: dict, state_dict2: dict):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -414,22 +551,33 @@ def build_model(state_dict: dict):
         assert output_width ** 2 + 1 == state_dict["visual.attnpool.positional_embedding"].shape[0]
         image_resolution = output_width * 32
 
-    embed_dim = state_dict["text_projection"].shape[1]
-    context_length = state_dict["positional_embedding"].shape[0]
-    vocab_size = state_dict["token_embedding.weight"].shape[0]
-    transformer_width = state_dict["ln_final.weight"].shape[0]
-    transformer_heads = transformer_width // 64
-    transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
+    if vit:
+        vision_width2 = state_dict2["visual.conv1.weight"].shape[0]
+        vision_layers2= len(
+            [k for k in state_dict2.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
+        vision_patch_size2 = state_dict2["visual.conv1.weight"].shape[-1]
+        grid_size2 = round((state_dict2["visual.positional_embedding"].shape[0] - 1) ** 0.5)
+        image_resolution2 = vision_patch_size2 * grid_size2
+    else:
+        counts2: list = [len(set(k.split(".")[2] for k in state_dict2 if k.startswith(f"visual.layer{b}"))) for b in
+                        [1, 2, 3, 4]]
+        vision_layers2 = tuple(counts2)
+        vision_width2 = state_dict2["visual.layer1.0.conv1.weight"].shape[0]
+        output_width2 = round((state_dict2["visual.attnpool.positional_embedding"].shape[0] - 1) ** 0.5)
+        vision_patch_size2 = None
+        assert output_width2 ** 2 + 1 == state_dict2["visual.attnpool.positional_embedding"].shape[0]
+        image_resolution2 = output_width2 * 32
 
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+        image_resolution2, vision_layers2, vision_width2, vision_patch_size2,
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
+            del state_dict2[key]
 
     convert_weights(model)
     model.load_state_dict(state_dict)
